@@ -12,69 +12,9 @@ Email : rfschuldt@uams.edu
 libname house '\\FileSrv1\CMS_Caregiver\DATA\Caregiver Households';
 libname cms '\\FileSrv1\CMS_Caregiver\DATA\Data Exploration';
 libname ahrf 'X:\Data\AHRF\2017-2018';
-libname ztca '\\FileSrv1\CMS_Caregiver\DATA\Xwalk';
 
 
 options mprint symbolgen;
-/* Call in the Master Beneficiary 2015 file*/
-data mbsf;
-	set cms.mbsf_abcd_summary;
-		if state_cnty_fips_cd_01 = state_cnty_fips_cd_01 then fips_check = 1;
-			else fips_check = 0;
-		
-	run;
-
-proc freq data = mbsf;
-title 'Check on discrepencies in the Jan to Dec Fips code';
-title2 'By patient';
-table fips_check;
-run;
-
-data mbsf_fips;
-	set mbsf;
-
-	/*** There is no change amongst the Fips County Code from Jan to December for all patients, so we can just use this. Do not need
-	to merge in the SSA to FIPS crosswalk, because we already have it***/
-	fips_merge = state_cnty_fips_cd_01;
-	fips_cnty = put(state_cnty_fips_cd_01, 12.);
-	** Age market **;
-
-	if AGE_AT_END_REF_YR >= 65 then age_mark = 1;
-		else age_mark = 0;
-	 
-	**Generating female variable**;
-	female = 0;
-	if SEX_IDENT_CD = '2' then female = 1;
-	if SEX_IDENT_CD = '0' then female = .;
-	
-	white = '0';
-	if rti_race_cd = '1' then white = 1;
-	if rti_race_cd = '0' then white = .;
-
-	black = '0';
-	if rti_race_cd = '2' then black = 1;
-	if rti_race_cd = '0' then black = .;
-
-	hispanic = 0;
-	if rti_race_cd = '5' then hispanic = 1;
-	if rti_race_cd = '0' then hispanic = .;
-
-	other_race = '0';
-	if rti_race_cd = '3' then other_race = 1;
-	if rti_race_cd = '4' then other_race = 1;
-	if rti_race_cd = '6' then other_race = 1;
-	if rti_race_cd = '0' then other_race = .;
-
-	if DUAL_ELGBL_MONS = 12 then dual = 1;
-		else dual = 0;
-	if 1 <= DUAL_ELGBL_MONS <=12 then part_dual = 1;
-		else part_dual = 0;
-
-	if BENE_HMO_CVRAGE_TOT_MONS = 0 then ffs= 1;
-		else ffs = 0;
-
-		run;
-
 
 /*Now I need to pull in my American Community Survey data*/
 
@@ -84,35 +24,59 @@ run;
 
 data numeric_vars;
 	set household;
-		keep fips Geography owner_household rental_household percent_owner percent_rental;
+		drop Geography;
+		
+%macro numeric(a);
 
-			owner_household = owner;
-			rental_household  = rental;
+	if &a = "-" then &a = "." ;
 
-			percent_owner = owner_oc/total_units;
-			percent_rental = renter_oc/total_units;
+	&a.num = input(&a, 12.);
 
+%mend;
+%numeric(rental_size)
+%numeric(percent_owner)
+%numeric(owner_size)
+		zta = put(Geography, z5.);
+	run;
+proc import datafile = "\\FileSrv1\CMS_Caregiver\DATA\Caregiver Households\income.xlsx"
+dbms = xlsx out= income replace;
+
+data median;
+	set income;
+	drop Geography;
+		zta = put(Geography, z5.);
+		if median_income = '-' or median_income = '(X)' then median_income = '.';
+		if median_income = '250,000+' then median_income = '250000';
+		if median_income = '2,500-' then median_income = '2500';
+		income_median = inputn(median_income, 12.);
 
 	run;
+
+
 /*Macro variable for calling my main variables*/
-%let measure = owner_household rental_household;
+%let measure = owner_housenum rental_housenum;
 
 /*Check the descriptive stats for household size*/
 proc means;
 var &measure;
 run;
 
-/*Now I need to fix the fips codes which do not match. These fips codes just need the leading zeros added on 
-which is an easy solution*/
-data fips_fix;
-	set numeric_vars;
-		drop fips;
-		length fips_merge $ 5;
-		fips_merge = put(fips, z5.);
+/*Now I need to merge with the HUD file for matching ZTA to ZIP code so I can properly merge with CC*/
+proc import datafile = '\\FileSrv1\CMS_Caregiver\DATA\Xwalk\part 1 crosswalk'
+dbms = xlsx out = zta1 replace;
+run;
+proc import datafile = '\\FileSrv1\CMS_Caregiver\DATA\Xwalk\part 2 crosswalk'
+dbms = xlsx out = zta2 replace;
+run;
 
-		merge_check = 1;
+data merge_zta;
+	set zta1
+	zta2;
+	drop ZCTA2KX;
+	length zta $5.;
+	zta = ZCTA2KX;
 
-	run;
+run;
 
 /*Inserting my sorting macro into the file to sort data for merging*/
 %macro sort(dataset, sorted);
@@ -121,20 +85,73 @@ by &sorted;
 run;
 
 %mend sort;
+%sort(median, zta)
+%sort(merge_zta, zta)
+%sort(numeric_vars, zta)
+/*Combine the survey data*/
 
-%sort(fips_fix, fips_merge)
-%sort(mbsf_fips, fips_merge)
+data house_income;
+	merge numeric_vars (in = a) median (in = b);
+	by zta;
+	if a;
+	if b;
+run;
+
 
 /*Merge the two together so we can see what the breakdown*/
+data house_zta;
+merge house_income (in = a) merge_zta (in = b);
+by zta;
+if a;
+if b;
+run;
 
-data msbf_house;
-	merge mbsf_fips (in = a) fips_fix (in = b);
-	by fips_merge;
-	if a;
+/*Now I add in the FIPS code so I can identify by state*/
+
+proc import datafile = '\\FileSrv1\CMS_Caregiver\DATA\Caregiver Households\zcta_county_rel_10.txt'
+dbms = dlm out = state_code replace;
+delimiter = ',';
+getnames = yes;
+run;
+
+data state;
+	set state_code;
+	keep zta state county state_name;
+	zta = put(ZCTA5, z5.);
+
+	state_name = fipstate(state);
 
 run;
 
-/*Checking those counties that did not match*/
+/*Merge with the household zta file*/
+%sort(house_zta, zta)
+%sort(state, zta)
+data state_house;
+	merge house_zta (in = a) state (in = b);
+	by zta;
+	if a;
+	if b;
+run;
+
+proc sort nodupkey;
+by zip;
+run;
+
+
+%sort(state_house, state_name)
+proc univariate;
+class zip;
+var income_median;
+by state_name;
+run;
+
+
+/****************************************************************************************************************
+this code is for previous version of project that was focused on County Level Data. Keeping for reference for how
+county can be used with the AHRF, but this is mothballed for this project.
+
+
+*Checking those counties that did not match*
 
 data county_check;
 	set msbf_house;
@@ -147,10 +164,10 @@ proc freq;
 table merge_check;
 run;
 
-/*We only have 7,000 out of 3 million + who do not match. Will kick these patients from sample. They all have
-location missing for parts of the year*/
+*We only have 7,000 out of 3 million + who do not match. Will kick these patients from sample. They all have
+location missing for parts of the year*
 
-/*remerge with both a and b join*/
+*remerge with both a and b join*
 data msbf_house;
 	merge mbsf_fips (in = a) fips_fix (in = b);
 	by fips_merge;
@@ -158,8 +175,7 @@ data msbf_house;
 	if b;
 
 run;
-
-/*now I need bring the AHRF data*/
+*now I need bring the AHRF data*
 
 data ahrf;
 	set ahrf.AHRF_2017_2018;
@@ -167,7 +183,7 @@ data ahrf;
 	median_income;
 	fips_merge = f00002;
 	percent_poverty = f1332115;
-	black_percent = F1464010/f0453010; /*percent for all these variables using 2010 census data*/
+	black_percent = F1464010/f0453010; *percent for all these variables using 2010 census data*
 	white_percent =  F1463910/f0453010;
 	native_percent = F1465610/f0453010;
 	asian_percent = F1345710/f0453010;
@@ -209,7 +225,7 @@ data patient_weight;
 	run;
 
 
-/*de duping for faster processing*/
+*de duping for faster processing*
 proc sort data = patient_weight;
 by fips_merge descending pat_count;
 run;
